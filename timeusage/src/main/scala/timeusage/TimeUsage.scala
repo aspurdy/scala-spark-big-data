@@ -5,7 +5,7 @@ import java.nio.file.Paths
 import org.apache.spark.sql._
 import org.apache.spark.sql.types._
 
-import scala.util.matching.Regex
+import scala.collection.mutable.ListBuffer
 
 /** Main class */
 object TimeUsage {
@@ -17,9 +17,10 @@ object TimeUsage {
     SparkSession
       .builder()
       .appName("Time Usage")
-      .config("spark.master", "local[4]")
+      .config("spark.master", "local[*]")
       .getOrCreate()
 
+  spark.sparkContext.setLogLevel("WARN")
   // For implicit conversions like converting RDDs to DataFrames
   import spark.implicits._
 
@@ -31,9 +32,14 @@ object TimeUsage {
   def timeUsageByLifePeriod(): Unit = {
     val (columns, initDf) = read("/timeusage/atussum.csv")
     val (primaryNeedsColumns, workColumns, otherColumns) = classifiedColumns(columns)
-    val summaryDf = timeUsageSummary(primaryNeedsColumns, workColumns, otherColumns, initDf)
+    val summaryDf = timeUsageSummary(primaryNeedsColumns, workColumns, otherColumns, initDf).cache()
+    val sqlDf = timeUsageGroupedSql(summaryDf)
+    sqlDf.show()
     val finalDf = timeUsageGrouped(summaryDf)
     finalDf.show()
+    val typedDf = timeUsageGroupedTyped(timeUsageSummaryTyped(summaryDf))
+    typedDf.show()
+
   }
 
   /** @return The read DataFrame along with its column names. */
@@ -95,20 +101,19 @@ object TimeUsage {
     *      “t10”, “t12”, “t13”, “t14”, “t15”, “t16” and “t18” (those which are not part of the previous groups only).
     */
   def classifiedColumns(columnNames: List[String]): (List[Column], List[Column], List[Column]) = {
+    val primaryNeedsBuffer, workingBuffer, leisureBuffer = ListBuffer[Column]()
+
     val primaryNeedsRegex = """^((?:t01|t03|t11|t1801|t1803).*)""".r
     val workingActivitiesRegex = """^((?:t05|t1805).*)""".r
     val leisureActivitiesRegex = """^((?:t02|t04|t06|t07|t08|t09|t10|t12|t13|t14|t15|t16|t18).*)""".r
 
-
-    def matchColumns(regex: Regex): List[Column] = {
-      columnNames.collect { case regex(x) => column(x) }
+    columnNames.foreach {
+        case primaryNeedsRegex(x) => primaryNeedsBuffer += column(x)
+        case workingActivitiesRegex(x) => workingBuffer += column(x)
+        case leisureActivitiesRegex(x) => leisureBuffer += column(x)
+        case _ => Unit
     }
-
-    val primaryNeedsColumns = matchColumns(primaryNeedsRegex)
-
-    val workingColumns = matchColumns(workingActivitiesRegex)
-    val leisureColumns = matchColumns(leisureActivitiesRegex)
-    (primaryNeedsColumns, workingColumns, leisureColumns)
+    (primaryNeedsBuffer.toList, workingBuffer.toList, leisureBuffer.toList)
   }
 
   /** @return a projection of the initial DataFrame such that all columns containing hours spent on primary needs
@@ -147,14 +152,14 @@ object TimeUsage {
                         df: DataFrame
                       ): DataFrame = {
 
-    val workingStatusProjection: Column = when(df("telfs").between(1, 2), "working")
+    val workingStatusProjection: Column = when('telfs.between(1, 2), "working")
       .otherwise("not working") as "working"
 
-    val sexProjection: Column = when(df("tesex") === 1, "male")
+    val sexProjection: Column = when('tesex === 1, "male")
       .otherwise("female") as "sex"
 
-    val ageProjection: Column = when(df("teage").between(15, 22), "young")
-      .when(df("teage").between(23, 55), "active")
+    val ageProjection: Column = when('teage.between(15, 22), "young")
+      .when('teage.between(23, 55), "active")
       .otherwise("elder") as "age"
 
     val primaryNeedsProjection: Column = primaryNeedsColumns.reduce(_ + _) / 60 as "primaryNeeds"
@@ -184,12 +189,12 @@ object TimeUsage {
     */
   def timeUsageGrouped(summed: DataFrame): DataFrame = {
     summed
-      .groupBy($"working", $"sex", $"age")
+      .groupBy('working, 'sex, 'age)
       .agg(
-        round(avg($"primaryNeeds"), 1).as("primaryNeeds"),
-        round(avg($"work"), 1).as("work"),
-        round(avg($"other"), 1).as("other"))
-      .sort($"working", $"sex", $"age")
+        round(avg('primaryNeeds), 1).as("primaryNeeds"),
+        round(avg('work), 1).as("work"),
+        round(avg('other), 1).as("other"))
+      .sort('working, 'sex, 'age)
   }
 
   /**
@@ -206,7 +211,11 @@ object TimeUsage {
     * @param viewName Name of the SQL view to use
     */
   def timeUsageGroupedSqlQuery(viewName: String): String =
-    ???
+    s"""SELECT working, sex, age, ROUND(AVG(primaryNeeds), 1) as primaryNeeds,
+       |ROUND(AVG(work), 1) as work, ROUND(AVG(other), 1) as other
+       |FROM $viewName
+       |GROUP BY working, sex, age
+       |ORDER BY working, sex, age""".stripMargin
 
   /**
     * @return A `Dataset[TimeUsageRow]` from the “untyped” `DataFrame`
@@ -216,7 +225,16 @@ object TimeUsage {
     *                           cast them at the same time.
     */
   def timeUsageSummaryTyped(timeUsageSummaryDf: DataFrame): Dataset[TimeUsageRow] =
-    ???
+    timeUsageSummaryDf.map(row =>
+      TimeUsageRow(
+        working = row.getAs[String]("working"),
+        sex = row.getAs[String]("sex"),
+        age = row.getAs[String]("age"),
+        primaryNeeds = row.getAs[Double]("primaryNeeds"),
+        work = row.getAs[Double]("work"),
+        other = row.getAs[Double]("other")
+      )
+    )
 
   /**
     * @return Same as `timeUsageGrouped`, but using the typed API when possible
@@ -231,7 +249,17 @@ object TimeUsage {
     */
   def timeUsageGroupedTyped(summed: Dataset[TimeUsageRow]): Dataset[TimeUsageRow] = {
     import org.apache.spark.sql.expressions.scalalang.typed
-    ???
+    summed
+      .groupByKey(row => (row.working, row.sex, row.age))
+      .agg(
+        round(typed.avg[TimeUsageRow](_.primaryNeeds), 1).as[Double],
+        round(typed.avg[TimeUsageRow](_.work), 1).as[Double],
+        round(typed.avg[TimeUsageRow](_.other), 1).as[Double]
+      )
+      .map { case (tpl, pn, w, o) => (tpl._1, tpl._2, tpl._3, pn, w, o) }
+      .toDF("working", "sex", "age", "primaryNeeds", "work", "other")
+      .orderBy('working, 'sex, 'age)
+      .as[TimeUsageRow]
   }
 }
 
